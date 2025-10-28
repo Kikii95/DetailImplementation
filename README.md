@@ -1,372 +1,559 @@
-# Refactorisation Architecture v2 - Asset Engine
+# Architecture v3 - Système Mutable avec ID Unique
 
 **Date** : 28 octobre 2025
-**Objectif** : Unifier l'architecture avec Stream::Header partout
+**Objectif** : Archives mutables (AddFile/RemoveFile) + ID unique + Utilisation File.h
 
 ---
 
-## 📋 Résumé des modifications
+## 🎯 Problèmes actuels (v2)
 
-### Avant (v1)
+### ❌ 1. Utilisation de FILE* au lieu de File
+```cpp
+// Actuellement dans Archive.cpp
+FILE* archive = nullptr;
+fopen_s(&archive, archivePath.c_str(), "rb");
 ```
-game.asset
-├── ArchiveHeader (magic "ASET")
-├── DATA SECTION (fichiers en RAW, sans header)
-└── FileEntry table (avec crc32 redondant)
+
+**Problème** : On n'utilise PAS `File.h/File.cpp` qui existent dans le projet !
+
+### ❌ 2. ID basé sur le nom de fichier
+```cpp
+struct FileEntry {
+    char filename[256];  // ← Identifiant = nom (problème si renommage)
+    // ...
+};
 ```
 
 **Problèmes** :
-- CRC32 dupliqué (FileEntry.crc32 + calcul manuel)
-- Pas de réutilisation de SafeReader
-- Impossible d'ajouter compression/chiffrement facilement
+- Si 2 fichiers ont le même nom → conflit
+- Impossible de renommer sans perdre la référence
+- Pas d'identifiant stable
 
-### Après (v2)
+### ❌ 3. Archive immuable
+```cpp
+// Impossible actuellement
+Archive::AddFile("game.asset", "newfile.txt");     // ❌ Pas implémenté
+Archive::RemoveFile("game.asset", "oldfile.txt");  // ❌ Pas implémenté
 ```
-game.asset
-├── ArchiveHeader (magic "ASET")
-├── DATA SECTION
-│   ├── Stream::Header (magic "SAFE") + fichier 1
-│   ├── Stream::Header (magic "SAFE") + fichier 2
-│   └── ...
-└── FileEntry table (SANS crc32, déjà dans Stream::Header)
+
+**Problème** : Il faut recréer toute l'archive pour ajouter/retirer un fichier !
+
+---
+
+## ✅ Solutions : Architecture v3
+
+### 1. Utiliser File au lieu de FILE*
+
+```cpp
+// Avant (v2)
+FILE* archive = nullptr;
+fopen_s(&archive, archivePath.c_str(), "rb");
+fread(buffer, 1, size, archive);
+fclose(archive);
+
+// Après (v3)
+File archive;
+archive.OpenRead(archivePath);
+archive.Read(buffer, size, 1);
+archive.Close();
 ```
 
 **Avantages** :
-- ✅ Hiérarchie cohérente : ArchiveHeader → Stream::Header → Data
-- ✅ CRC32 unifié (une seule source de vérité)
-- ✅ Prêt pour compression (flags dans Stream::Header)
-- ✅ Architecture extensible
+- ✅ Cohérent avec le reste du projet (Stream → File)
+- ✅ Gestion automatique (destructeur appelle Close())
+- ✅ Interface propre et orientée objet
 
 ---
 
-## 🔧 Fichiers modifiés
+### 2. ID unique par fichier
 
-### 1. `Stream.h`
-
-**Changements** :
 ```cpp
-// Avant
-struct Header {
-    char   magic[4];
-    UINT32 version;      // 4 bytes
-    UINT32 dataSize;     // 4 bytes
-    UINT32 checksum;
-};
-// Total: 16 bytes
-
-// Après
-struct Header {
-    char   magic[4];
-    UINT16 version;       // 2 bytes
-    UINT16 flags;         // 2 bytes (NOUVEAU)
-    UINT64 dataSize;      // 8 bytes
-    UINT64 originalSize;  // 8 bytes (NOUVEAU, pour compression)
-    UINT32 checksum;
-};
-// Total: 28 bytes
-
-enum Flags : UINT16 {
-    NONE       = 0x0000,
-    COMPRESSED = 0x0001,  // Pour bonus compression
-    ENCRYPTED  = 0x0002   // Pour bonus chiffrement
-};
-```
-
-**Impact** :
-- Taille header passe de 16 → 28 bytes (+12 bytes/fichier)
-- Support flags pour features futures
-- dataSize et originalSize en UINT64 (fichiers > 4 GB)
-
----
-
-### 2. `Archive.h`
-
-**Changements** :
-```cpp
-// Avant
 struct FileEntry {
-    char   filename[256];
+    UINT64 id;              // ID unique (timestamp + hash ou UUID)
+    char   filename[256];   // Nom humainement lisible (peut changer)
     UINT64 offset;
     UINT64 size;
-    UINT32 crc32;        // ← Redondant avec Stream::Header
+    UINT8  flags;           // ACTIVE | DELETED | COMPRESSED | ENCRYPTED
 };
-// Total: 280 bytes
-
-// Après
-struct FileEntry {
-    char   filename[256];
-    UINT64 offset;       // Pointe vers Stream::Header maintenant
-    UINT64 size;         // Inclut sizeof(Stream::Header) + dataSize
-};
-// Total: 272 bytes (-8 bytes/fichier)
 ```
 
-**Impact** :
-- Retrait du champ `crc32` (maintenant dans Stream::Header.checksum)
-- `entry.offset` pointe vers Stream::Header (pas directement les données)
-- `entry.size` = sizeof(Stream::Header) + taille données
-
----
-
-### 3. `Archive.cpp`
-
-**Fonction** `Create()` :
+**Génération ID** :
 ```cpp
-// Avant
-fwrite(fileData.GetData(), 1, fileData.GetSize(), archive);  // RAW data
-entry.crc32 = SafeReader::CalculateCRC32(...);               // Calcul manuel
+// Option 1 : Timestamp + Hash
+UINT64 GenerateFileID(const std::string& filename) {
+    UINT64 timestamp = GetCurrentTimestamp();  // 64 bits Unix timestamp
+    UINT32 hash = CalculateCRC32((UINT8*)filename.c_str(), filename.size());
+    return (timestamp << 32) | hash;
+}
 
-// Après
-Stream::Header streamHeader;
-streamHeader.magic = "SAFE";
-streamHeader.version = 1;
-streamHeader.flags = Stream::NONE;
-streamHeader.dataSize = fileData.GetSize();
-streamHeader.originalSize = fileData.GetSize();
-streamHeader.checksum = SafeReader::CalculateCRC32(...);
-
-fwrite(&streamHeader, 1, sizeof(Stream::Header), archive);   // Header d'abord
-fwrite(fileData.GetData(), 1, fileData.GetSize(), archive);  // Puis data
-```
-
-**Fonction** `Extract()` :
-```cpp
-// Avant
-fseek(archive, entry.offset, SEEK_SET);
-fread(buffer, 1, entry.size, archive);                      // Lire RAW
-UINT32 crc = SafeReader::CalculateCRC32(...);
-if (crc != entry.crc32) return false;                       // Valider avec FileEntry
-
-// Après
-fseek(archive, entry.offset, SEEK_SET);
-Stream::Header streamHeader;
-fread(&streamHeader, 1, sizeof(Stream::Header), archive);   // Lire header d'abord
-// Valider magic "SAFE"
-fread(buffer, 1, streamHeader.dataSize, archive);           // Lire data
-UINT32 crc = SafeReader::CalculateCRC32(...);
-if (crc != streamHeader.checksum) return false;             // Valider avec Stream::Header
-```
-
-**Fonction** `List()` :
-```cpp
-// Avant
-std::cout << entry.filename << " (" << entry.size << " bytes, CRC32: 0x"
-          << entry.crc32 << ")\n";                            // CRC depuis FileEntry
-
-// Après
-Stream::Header streamHeader;
-fread(&streamHeader, 1, sizeof(Stream::Header), archive);
-std::cout << entry.filename << " (" << streamHeader.dataSize << " bytes, CRC32: 0x"
-          << streamHeader.checksum << ")\n";                  // CRC depuis Stream::Header
-```
-
-**Fonction** `Validate()` :
-```cpp
-// Avant
-UINT32 crc = SafeReader::CalculateCRC32(...);
-if (crc == entry.crc32) std::cout << "[OK]";                // Compare avec FileEntry
-
-// Après
-Stream::Header streamHeader;
-fread(&streamHeader, 1, sizeof(Stream::Header), archive);
-// Valider magic "SAFE"
-UINT32 crc = SafeReader::CalculateCRC32(...);
-if (crc == streamHeader.checksum) std::cout << "[OK]";       // Compare avec Stream::Header
-```
-
----
-
-### 4. `SafeReader.cpp`
-
-**Fonction** `WriteFile()` :
-```cpp
-// Avant
-header.version = version;             // UINT32
-header.dataSize = (UINT32)size;       // Cast vers UINT32
-// Pas de flags
-
-// Après
-header.version = (UINT16)version;     // UINT16
-header.flags = Stream::NONE;          // NOUVEAU
-header.dataSize = size;               // UINT64 (pas de cast)
-header.originalSize = size;           // NOUVEAU
-```
-
-**Fonction** `Validate()` :
-```cpp
-// Avant
-long fileSize = ftell(file);
-long expectedSize = sizeof(Stream::Header) + header.dataSize;
-
-// Après
-UINT64 fileSize = ftell(file);
-UINT64 expectedSize = sizeof(Stream::Header) + header.dataSize;  // dataSize = UINT64
-```
-
----
-
-## 🔍 Structure binaire comparée
-
-### Avant v1
-```
-game.asset (2682 bytes pour 2 fichiers de 2048 B + 42 B)
-
-[0x000] ArchiveHeader (32 bytes)
-[0x020] logo.png RAW data (2048 bytes)       ← Pas de header
-[0x820] readme.txt RAW data (42 bytes)       ← Pas de header
-[0x84A] FileEntry logo.png (280 bytes)
-          - filename, offset, size, crc32
-[0x962] FileEntry readme.txt (280 bytes)
-          - filename, offset, size, crc32
-
-Total: 32 + 2090 + 560 = 2682 bytes
-```
-
-### Après v2
-```
-game.asset (2738 bytes pour 2 fichiers de 2048 B + 42 B)
-
-[0x000] ArchiveHeader (32 bytes)
-[0x020] Stream::Header (28 bytes)            ← NOUVEAU header
-[0x03C] logo.png data (2048 bytes)
-[0x83C] Stream::Header (28 bytes)            ← NOUVEAU header
-[0x858] readme.txt data (42 bytes)
-[0x882] FileEntry logo.png (272 bytes)       ← Pas de crc32
-          - filename, offset, size
-[0x992] FileEntry readme.txt (272 bytes)     ← Pas de crc32
-          - filename, offset, size
-
-Total: 32 + 2076 + 56 + 544 = 2738 bytes (+56 bytes = 2 × 28 bytes header)
-```
-
-**Overhead** : +28 bytes par fichier (acceptable pour les avantages)
-
----
-
-## 🎯 Compilation
-
-### Étapes
-1. Ouvrir `ide/AssetEngine.sln` dans Visual Studio 2022
-2. Configuration : **x64 / Debug** (ou Release)
-3. **Build → Rebuild Solution** (Ctrl + Shift + B)
-4. Vérifier qu'il n'y a **aucune erreur**
-
-### Warnings attendus
-- Possible warning "cast UINT64 → long" dans SafeReader (peut être ignoré)
-- Pas d'autres warnings attendus
-
-### En cas d'erreur
-- Erreur "structure size mismatch" → Rebuild All (clean cache)
-- Erreur "undefined reference" → Vérifier que `Stream::NONE` est bien défini
-- Erreur de linking → Vérifier que tous les .cpp sont dans le .vcxproj
-
----
-
-## ✅ Tests à effectuer après compilation
-
-### Test 1 : Créer archive
-```cmd
-AssetEngine.exe create test.asset file1.txt file2.txt
-```
-
-**Vérifications** :
-- Archive créée sans erreur
-- Taille ≈ taille fichiers + overhead (32 + N×28 + N×272)
-
-### Test 2 : Lister archive
-```cmd
-AssetEngine.exe list test.asset
-```
-
-**Attendu** :
-```
-==========================================
-Archive: test.asset
-Files: 2
-==========================================
-[1] file1.txt (XXX bytes, CRC32: 0xXXXXXXXX)
-[2] file2.txt (XXX bytes, CRC32: 0xXXXXXXXX)
-==========================================
-```
-
-### Test 3 : Valider intégrité
-```cmd
-AssetEngine.exe validate test.asset
-```
-
-**Attendu** :
-```
-Validating archive: test.asset
-Files to check: 2
-[OK] file1.txt
-[OK] file2.txt
-Archive is valid.
-```
-
-### Test 4 : Extraire fichier
-```cmd
-AssetEngine.exe extract test.asset file1.txt extracted_file1.txt
-```
-
-**Vérifications** :
-- Fichier extrait créé
-- Contenu identique à l'original (diff ou comp)
-
-### Test 5 : Extraire tout
-```cmd
-AssetEngine.exe extractall test.asset extracted/
-```
-
-**Vérifications** :
-- Dossier `extracted/` créé
-- Tous les fichiers présents
-- Contenu identique aux originaux
-
----
-
-## 🚀 Prochaines étapes (optionnel)
-
-### Bonus CDC : Compression zlib
-```cpp
-// Dans Archive::Create()
-if (streamHeader.dataSize > 1024) {  // Compresser si > 1 KB
-    UINT8* compressed = new UINT8[fileSize];
-    uLongf compressedSize = fileSize;
-
-    if (compress2(compressed, &compressedSize, fileData.GetData(), fileSize, Z_BEST_COMPRESSION) == Z_OK) {
-        if (compressedSize < fileSize * 0.9) {  // Gain > 10%
-            streamHeader.flags = Stream::COMPRESSED;
-            streamHeader.dataSize = compressedSize;
-            streamHeader.originalSize = fileSize;
-            fwrite(&streamHeader, 1, sizeof(Stream::Header), archive);
-            fwrite(compressed, 1, compressedSize, archive);
-        }
-    }
+// Option 2 : UUID (plus robuste)
+UINT64 GenerateUUID() {
+    // Utiliser std::random_device + distribution
+    // Ou UUID v4 (128 bits tronqué à 64)
 }
 ```
 
-### Bonus CDC : Chiffrement AES
+**Avantages** :
+- ✅ ID stable même si on renomme le fichier
+- ✅ Pas de collision (timestamp + hash quasi unique)
+- ✅ Permet référencement externe (ex: save game pointe vers ID, pas nom)
+
+---
+
+### 3. Index mutable avec flags
+
 ```cpp
-streamHeader.flags = Stream::ENCRYPTED;
-// Chiffrer fileData avec AES-256
+enum FileFlags : UINT8 {
+    FILE_ACTIVE     = 0x01,  // Fichier actif
+    FILE_DELETED    = 0x02,  // Fichier marqué deleted (espace réutilisable)
+    FILE_COMPRESSED = 0x04,  // Stream compressé (zlib)
+    FILE_ENCRYPTED  = 0x08   // Stream chiffré (AES)
+};
+```
+
+**Structure FileEntry étendue** :
+```cpp
+struct FileEntry {
+    UINT64 id;              // ID unique
+    char   filename[256];   // Nom (peut être renommé)
+    UINT64 offset;          // Position dans l'archive
+    UINT64 size;            // Taille (header + data)
+    UINT8  flags;           // Flags (active, deleted, etc.)
+    UINT8  padding[7];      // Alignement à 280 bytes
+};
+// Total: 280 bytes (même taille qu'avant pour compatibilité)
 ```
 
 ---
 
-## 📊 Comparaison finale
+## 🔧 Nouvelles fonctions API
 
-| Aspect | v1 (avant) | v2 (après) |
-|--------|------------|------------|
-| **Hiérarchie** | ArchiveHeader → RAW data → FileEntry | ArchiveHeader → Stream::Header → Data → FileEntry |
-| **CRC32** | 2 sources (FileEntry + calcul manuel) | 1 source (Stream::Header uniquement) |
-| **Validation** | Code custom dans Archive.cpp | Réutilisation SafeReader (cohérent) |
-| **Compression** | ❌ Impossible sans tout refaire | ✅ Ajouter flag + zlib (facile) |
-| **Chiffrement** | ❌ Impossible | ✅ Ajouter flag + AES (facile) |
-| **Overhead** | 0 bytes/fichier | +28 bytes/fichier (header) |
-| **FileEntry size** | 280 bytes | 272 bytes (-8 bytes, crc32 retiré) |
-| **Extensibilité** | ❌ Faible | ✅ Excellente (flags, version) |
-| **Code quality** | ❌ Duplication (2 systèmes CRC32) | ✅ DRY (une seule source de vérité) |
+### Archive::AddFile()
+
+```cpp
+bool Archive::AddFile(const std::string& archivePath,
+                      const std::string& filePath,
+                      UINT64& outFileID)
+{
+    // 1. Ouvrir archive en mode WRITE (r+b)
+    File archive;
+    archive.Open(archivePath, WRITE);
+
+    // 2. Lire header + index
+    ArchiveHeader header;
+    std::vector<FileEntry> entries = ReadIndex(archive, header);
+
+    // 3. Chercher espace libre (entry avec flag DELETED)
+    FileEntry* freeEntry = FindDeletedEntry(entries);
+
+    if (freeEntry != nullptr && freeEntry->size >= neededSize) {
+        // Réutiliser l'espace
+        WriteFileToOffset(archive, freeEntry->offset, filePath);
+        freeEntry->flags = FILE_ACTIVE;
+        freeEntry->id = GenerateFileID(filePath);
+        // ...
+    } else {
+        // Ajouter à la fin (avant l'index)
+        UINT64 insertOffset = header.indexOffset;
+        archive.Seek(insertOffset, SEEK_SET);
+        WriteFileWithHeader(archive, filePath);
+
+        // Créer nouvelle entry
+        FileEntry newEntry;
+        newEntry.id = GenerateFileID(filePath);
+        newEntry.flags = FILE_ACTIVE;
+        // ...
+        entries.push_back(newEntry);
+    }
+
+    // 4. Réécrire index
+    header.fileCount = CountActiveFiles(entries);
+    header.indexOffset = /* nouvelle position */;
+    WriteIndex(archive, entries, header);
+
+    // 5. Mettre à jour header
+    archive.Seek(0, SEEK_SET);
+    archive.Write((UINT8*)&header, sizeof(ArchiveHeader), 1);
+
+    archive.Close();
+    return true;
+}
+```
 
 ---
 
-**Conclusion** : Architecture v2 est **cohérente, extensible et prête pour les bonus du CDC** (compression, chiffrement). L'overhead de +28 bytes/fichier est négligeable par rapport aux avantages.
+### Archive::RemoveFile()
+
+```cpp
+bool Archive::RemoveFile(const std::string& archivePath, UINT64 fileID)
+{
+    // 1. Ouvrir archive en mode WRITE
+    File archive;
+    archive.Open(archivePath, WRITE);
+
+    // 2. Lire index
+    ArchiveHeader header;
+    std::vector<FileEntry> entries = ReadIndex(archive, header);
+
+    // 3. Trouver entry par ID
+    auto it = std::find_if(entries.begin(), entries.end(),
+        [fileID](const FileEntry& e) { return e.id == fileID; });
+
+    if (it == entries.end())
+        return false;  // Fichier non trouvé
+
+    // 4. Marquer comme deleted (soft delete)
+    it->flags = FILE_DELETED;
+
+    // 5. Réécrire index
+    WriteIndex(archive, entries, header);
+
+    // 6. Mettre à jour header (fileCount actifs)
+    header.fileCount = CountActiveFiles(entries);
+    archive.Seek(0, SEEK_SET);
+    archive.Write((UINT8*)&header, sizeof(ArchiveHeader), 1);
+
+    archive.Close();
+    return true;
+}
+```
+
+**Note** : On ne supprime PAS physiquement les données, juste le flag. Les données restent jusqu'au `Compact()`.
+
+---
+
+### Archive::Compact()
+
+```cpp
+bool Archive::Compact(const std::string& archivePath)
+{
+    // 1. Lire archive actuelle
+    File oldArchive;
+    oldArchive.OpenRead(archivePath);
+
+    ArchiveHeader header;
+    std::vector<FileEntry> entries = ReadIndex(oldArchive, header);
+
+    // 2. Créer archive temporaire
+    std::string tempPath = archivePath + ".tmp";
+    File newArchive;
+    newArchive.OpenWrite(tempPath);
+
+    // 3. Écrire header temporaire
+    ArchiveHeader newHeader = header;
+    newHeader.fileCount = CountActiveFiles(entries);
+    newArchive.Write((UINT8*)&newHeader, sizeof(ArchiveHeader), 1);
+
+    // 4. Copier UNIQUEMENT les fichiers actifs
+    UINT64 currentOffset = sizeof(ArchiveHeader);
+    std::vector<FileEntry> newEntries;
+
+    for (const auto& entry : entries) {
+        if (!(entry.flags & FILE_ACTIVE))
+            continue;  // Skip deleted
+
+        // Lire blob depuis ancienne archive
+        oldArchive.Seek(entry.offset, SEEK_SET);
+        Blob blob;
+        blob.Reserve(entry.size);
+        oldArchive.Read(blob.GetData(), entry.size, 1);
+
+        // Écrire dans nouvelle archive
+        newArchive.Write(blob.GetData(), entry.size, 1);
+
+        // Créer nouvelle entry avec nouvel offset
+        FileEntry newEntry = entry;
+        newEntry.offset = currentOffset;
+        newEntries.push_back(newEntry);
+
+        currentOffset += entry.size;
+    }
+
+    // 5. Écrire nouvel index
+    newHeader.indexOffset = currentOffset;
+    WriteIndex(newArchive, newEntries, newHeader);
+
+    // 6. Mettre à jour header
+    newArchive.Seek(0, SEEK_SET);
+    newArchive.Write((UINT8*)&newHeader, sizeof(ArchiveHeader), 1);
+
+    oldArchive.Close();
+    newArchive.Close();
+
+    // 7. Remplacer ancienne archive
+    remove(archivePath.c_str());
+    rename(tempPath.c_str(), archivePath.c_str());
+
+    return true;
+}
+```
+
+---
+
+### Archive::RenameFile()
+
+```cpp
+bool Archive::RenameFile(const std::string& archivePath,
+                         UINT64 fileID,
+                         const std::string& newName)
+{
+    File archive;
+    archive.Open(archivePath, WRITE);
+
+    ArchiveHeader header;
+    std::vector<FileEntry> entries = ReadIndex(archive, header);
+
+    // Trouver par ID (pas par nom !)
+    auto it = std::find_if(entries.begin(), entries.end(),
+        [fileID](const FileEntry& e) { return e.id == fileID; });
+
+    if (it == entries.end())
+        return false;
+
+    // Changer le nom (l'ID reste le même)
+    strncpy_s(it->filename, 256, newName.c_str(), _TRUNCATE);
+
+    // Réécrire index
+    WriteIndex(archive, entries, header);
+
+    archive.Close();
+    return true;
+}
+```
+
+---
+
+### Archive::FindByID()
+
+```cpp
+bool Archive::FindByID(const std::string& archivePath,
+                       UINT64 fileID,
+                       FileEntry& outEntry)
+{
+    File archive;
+    archive.OpenRead(archivePath);
+
+    ArchiveHeader header;
+    std::vector<FileEntry> entries = ReadIndex(archive, header);
+
+    auto it = std::find_if(entries.begin(), entries.end(),
+        [fileID](const FileEntry& e) {
+            return e.id == fileID && (e.flags & FILE_ACTIVE);
+        });
+
+    if (it == entries.end())
+        return false;
+
+    outEntry = *it;
+    archive.Close();
+    return true;
+}
+```
+
+---
+
+## 📊 Comparaison architectures
+
+| Aspect | v2 (actuel) | v3 (proposé) | Gain |
+|--------|-------------|--------------|------|
+| **Classe utilisée** | FILE* (C) | File (C++ OOP) | ✅ Cohérence |
+| **Identifiant** | Nom fichier | ID unique 64-bit | ✅ Stabilité |
+| **Mutabilité** | Immuable (recréer tout) | Mutable (AddFile/RemoveFile) | ✅ Performance |
+| **Renommage** | ❌ Perte référence | ✅ ID stable | ✅ Flexibilité |
+| **Défragmentation** | N/A | Compact() | ✅ Optimisation |
+| **Gestion espace** | Linéaire (append) | Réutilisation espaces libres | ✅ Efficacité |
+| **API** | 5 fonctions | 9 fonctions | ✅ Complet |
+
+---
+
+## 🔧 Nouvelles structures
+
+### ArchiveHeader (inchangé)
+```cpp
+struct ArchiveHeader {
+    char   magic[4];      // "ASET"
+    UINT32 version;       // 2 (nouvelle version)
+    UINT32 fileCount;     // Nombre de fichiers ACTIFS
+    UINT64 indexOffset;
+    UINT64 dataOffset;
+    UINT32 archiveCRC;
+};
+```
+
+### FileEntry (refactorisé)
+```cpp
+struct FileEntry {
+    UINT64 id;              // ID unique (nouveau)
+    char   filename[256];   // Nom (peut changer)
+    UINT64 offset;
+    UINT64 size;
+    UINT8  flags;           // Flags (nouveau)
+    UINT8  padding[7];      // Alignement
+};
+// Total: 280 bytes
+```
+
+### Stream::Header (inchangé)
+```cpp
+struct Header {
+    char   magic[4];        // "SAFE"
+    UINT16 version;
+    UINT16 flags;
+    UINT64 dataSize;
+    UINT64 originalSize;
+    UINT32 checksum;
+};
+```
+
+---
+
+## 🎯 API complète v3
+
+```cpp
+class Archive {
+public:
+    // Existantes (refactorisées)
+    static bool Create(const std::string& archivePath, const std::vector<std::string>& filePaths);
+    static bool List(const std::string& archivePath);
+    static bool Extract(const std::string& archivePath, UINT64 fileID, const std::string& outputPath);
+    static bool ExtractAll(const std::string& archivePath, const std::string& outputDir);
+    static bool Validate(const std::string& archivePath);
+
+    // NOUVELLES fonctions mutabilité
+    static bool AddFile(const std::string& archivePath, const std::string& filePath, UINT64& outFileID);
+    static bool RemoveFile(const std::string& archivePath, UINT64 fileID);
+    static bool RenameFile(const std::string& archivePath, UINT64 fileID, const std::string& newName);
+    static bool Compact(const std::string& archivePath);
+
+    // NOUVELLES fonctions recherche par ID
+    static bool FindByID(const std::string& archivePath, UINT64 fileID, FileEntry& outEntry);
+    static bool FindByName(const std::string& archivePath, const std::string& filename, FileEntry& outEntry);
+
+private:
+    // Helpers
+    static UINT64 GenerateFileID(const std::string& filename);
+    static UINT32 CountActiveFiles(const std::vector<FileEntry>& entries);
+    static FileEntry* FindDeletedEntry(std::vector<FileEntry>& entries, UINT64 minSize);
+    static std::vector<FileEntry> ReadIndex(File& archive, const ArchiveHeader& header);
+    static bool WriteIndex(File& archive, const std::vector<FileEntry>& entries, ArchiveHeader& header);
+    static bool WriteFileWithHeader(File& archive, const std::string& filePath, UINT64& outID);
+};
+```
+
+---
+
+## 🧪 Exemples d'utilisation
+
+### Créer archive
+```cpp
+std::vector<std::string> files = {"file1.txt", "file2.txt"};
+Archive::Create("game.asset", files);
+```
+
+### Ajouter fichier
+```cpp
+UINT64 fileID;
+Archive::AddFile("game.asset", "newfile.txt", fileID);
+std::cout << "Ajouté avec ID: " << fileID << "\n";
+```
+
+### Extraire par ID
+```cpp
+UINT64 fileID = 12345678;
+Archive::Extract("game.asset", fileID, "extracted.txt");
+```
+
+### Renommer
+```cpp
+Archive::RenameFile("game.asset", fileID, "renamed.txt");
+```
+
+### Supprimer (soft delete)
+```cpp
+Archive::RemoveFile("game.asset", fileID);
+```
+
+### Défragmenter
+```cpp
+Archive::Compact("game.asset");  // Reconstruit sans les fichiers deleted
+```
+
+---
+
+## 📐 Structure archive v3
+
+```
+game.asset (après Add/Remove)
+┌─────────────────────────────────────────┐
+│ ArchiveHeader                           │
+│ version = 2, fileCount = 2 (actifs)    │
+├─────────────────────────────────────────┤
+│ Stream::Header + file1.txt data         │
+│ (flags = ACTIVE)                        │
+├─────────────────────────────────────────┤
+│ Stream::Header + file2.txt data         │
+│ (flags = DELETED) ← Espace réutilisable│
+├─────────────────────────────────────────┤
+│ Stream::Header + file3.txt data         │
+│ (flags = ACTIVE)                        │
+├─────────────────────────────────────────┤
+│ FileEntry table                         │
+│ [1] id=123, filename="file1.txt", flags=ACTIVE
+│ [2] id=456, filename="file2.txt", flags=DELETED
+│ [3] id=789, filename="file3.txt", flags=ACTIVE
+└─────────────────────────────────────────┘
+```
+
+---
+
+## ✅ Checklist implémentation
+
+- [ ] Refactoriser Archive.h avec nouvelles structures
+- [ ] Remplacer FILE* par File dans Archive.cpp
+- [ ] Implémenter GenerateFileID()
+- [ ] Refactoriser Create/List/Extract/Validate pour utiliser File
+- [ ] Implémenter AddFile()
+- [ ] Implémenter RemoveFile()
+- [ ] Implémenter RenameFile()
+- [ ] Implémenter Compact()
+- [ ] Implémenter FindByID() / FindByName()
+- [ ] Mettre à jour main.cpp avec nouvelles commandes CLI
+- [ ] Tester workflow complet
+- [ ] Mettre à jour documentation
+
+---
+
+## 🎁 Bonus : CLI étendu
+
+```bash
+# Créer archive
+AssetEngine.exe create game.asset file1.txt file2.txt
+
+# Lister avec IDs
+AssetEngine.exe list game.asset
+# Output:
+# [ID: 123456] file1.txt (100 bytes, ACTIVE)
+# [ID: 789012] file2.txt (200 bytes, ACTIVE)
+
+# Ajouter fichier
+AssetEngine.exe add game.asset newfile.txt
+# Output: Added with ID: 345678
+
+# Extraire par ID
+AssetEngine.exe extract-id game.asset 123456 output.txt
+
+# Renommer
+AssetEngine.exe rename game.asset 123456 renamed.txt
+
+# Supprimer
+AssetEngine.exe remove game.asset 123456
+
+# Défragmenter
+AssetEngine.exe compact game.asset
+```
+
+---
+
+**Conclusion** : Architecture v3 = Archives mutables + ID unique + Cohérence File.h
+
+**Prêt à implémenter ?** Cette architecture est extensible et optimale.
